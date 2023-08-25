@@ -5,11 +5,11 @@
 
 unsigned long long int djb_hash(char * str, unsigned long long int len) {
 	unsigned long long int hash = 5381;
-	char c;
+	unsigned long long int i = 0;
 
-	while (len-- && str++) {
-		c = *str;
-		hash = ((hash << 5) + hash) + c;
+	while (i < len) {
+		hash = ((hash << 5) + hash) + str[i];
+		++i;
 	}
 
 	return hash;
@@ -45,8 +45,6 @@ unsigned char isdelim_default(char c) {
 
 typedef struct ParserKey {
 	unsigned long long int hash;
-	unsigned long long int length;
-	char * original;
 } parser_key_t;
 
 struct {
@@ -56,11 +54,22 @@ struct {
 	is_char_valid_f isdelim;
 } static parser_hash_table;
 
+void printword(FILE * fp, char * start, unsigned long long int length) {
+	if (start == NULL || length == 0) {
+		fprintf(fp, "(nil)");
+		return;
+	}
+	unsigned long long int i = 0;
+	do {
+		putc(start[i], fp);
+	} while (++i < length);
+}
+
 int parser_hash_table_add(char * key, unsigned long long int keylen, unsigned long long int value) {
 	unsigned long long int hash = djb_hash(key, keylen);
 	if (parser_hash_table.keyarray == NULL) {
 		parser_hash_table.length = 1;
-		parser_hash_table.keyarray = malloc(parser_hash_table.length * sizeof(key_t));
+		parser_hash_table.keyarray = malloc(parser_hash_table.length * sizeof(parser_key_t));
 		if (parser_hash_table.keyarray == NULL) {
 			abort();
 		}
@@ -69,26 +78,13 @@ int parser_hash_table_add(char * key, unsigned long long int keylen, unsigned lo
 			abort();
 		}
 
-		parser_hash_table.keyarray[0].hash = hash;
-		parser_hash_table.keyarray[0].length = keylen;
-		parser_hash_table.keyarray[0].original = strdup(key);
-		parser_hash_table.valuearray[0] = value;
+		parser_hash_table.keyarray[parser_hash_table.length - 1].hash = hash;
+		parser_hash_table.valuearray[parser_hash_table.length - 1] = value;
 		return 0;
 	}
 
-	unsigned long long int i;
-	for (i = 0; i < parser_hash_table.length; ++i) {
-		if (parser_hash_table.keyarray[i].hash == hash) {
-			break;
-		}
-	}
-
-	/* matching key already in hash table */
-	if (i < parser_hash_table.length) {
-		return -1;
-	}
-
-	parser_hash_table.keyarray = realloc(parser_hash_table.keyarray, parser_hash_table.length * sizeof(key_t));
+	++parser_hash_table.length;
+	parser_hash_table.keyarray = realloc(parser_hash_table.keyarray, parser_hash_table.length * sizeof(parser_key_t));
 	if (parser_hash_table.keyarray == NULL) {
 		abort();
 	}
@@ -97,10 +93,8 @@ int parser_hash_table_add(char * key, unsigned long long int keylen, unsigned lo
 		abort();
 	}
 
-	parser_hash_table.keyarray[0].hash = hash;
-	parser_hash_table.keyarray[0].length = keylen;
-	parser_hash_table.keyarray[0].original = strdup(key);
-	parser_hash_table.valuearray[0] = value;
+	parser_hash_table.keyarray[parser_hash_table.length - 1].hash = hash;
+	parser_hash_table.valuearray[parser_hash_table.length - 1] = value;
 
 	return 0;
 }
@@ -137,9 +131,6 @@ int parser_init(void) {
 
 int parser_deinit(void) {
 	if (parser_hash_table.keyarray != NULL) {
-		for (unsigned long long int i = 0; i < parser_hash_table.length; ++i) {
-			free(parser_hash_table.keyarray[i].original);
-		}
 		free(parser_hash_table.keyarray);
 	}
 	if (parser_hash_table.valuearray != NULL) {
@@ -159,10 +150,9 @@ unsigned char isnewline(char c) {
 
 parser_syntax_enum parser_find_match(char * start, unsigned long long int length) {
 	for (unsigned long long int i = 0; i < parser_hash_table.length; ++i) {
-		if (parser_hash_table.keyarray[i].length == length) {
-			if (strncmp(start, parser_hash_table.keyarray[i].original, length) == 0) {
-				return parser_hash_table.valuearray[i];
-			}
+		unsigned long long int hash = djb_hash(start, length);
+		if (parser_hash_table.keyarray[i].hash == hash) {
+			return parser_hash_table.valuearray[i];
 		}
 	}
 
@@ -173,8 +163,9 @@ int parse(char * start, char ** out_end) {
 	char c = 127;
 	char nextc = 127;
 	char prevc = 127;
+	char lastvalidc = 127;
 	unsigned long long int i = 0;
-	unsigned long long int line = 0;
+	unsigned long long int line = 1;
 
 	struct {
 		char * start;
@@ -184,6 +175,49 @@ int parse(char * start, char ** out_end) {
 		.start = NULL,
 		.length = 0,
 		.syntax = PARSER_SYNTAX_UNSET,
+	};
+
+	struct {
+		enum {
+			CONTEXT_STATE_NONE = 0,
+			CONTEXT_STATE_VAR,
+			CONTEXT_STATE_FUNC,
+			CONTEXT_STATE_TYPED_ITEM,
+		} state;
+		unsigned char is_named;
+		unsigned char is_typed;
+		unsigned char is_valued;
+		unsigned char is_done;
+		struct {
+			char * start;
+			unsigned long long int length;
+		} name;
+		struct {
+			char * start;
+			unsigned long long int length;
+		} type;
+		struct {
+			char * start;
+			unsigned long long int length;
+		} value;
+	} context = {
+		.state = CONTEXT_STATE_NONE,
+		.is_named = 0,
+		.is_typed = 0,
+		.is_valued = 0,
+		.is_done = 0,
+		.name = {
+			.start = NULL,
+			.length = 0,
+		},
+		.type = {
+			.start = NULL,
+			.length = 0,
+		},
+		.value = {
+			.start = NULL,
+			.length = 0,
+		},
 	};
 
 	while (c != '\0') {
@@ -196,16 +230,60 @@ int parse(char * start, char ** out_end) {
 		if (i != 0) {
 			prevc = start[i - 1];
 		}
-		
-		if (iswhitespace(c)) {
-			if (word.syntax == PARSER_SYNTAX_UNSET && word.length > 0) {
-				printf("Unknown syntax at (line: %llu, column: %llu)\n", line, i);
-				*out_end = &start[i];
-				return 1;
-			}
+
+		if (c == ':') {
+			context.state = CONTEXT_STATE_TYPED_ITEM;
+			context.is_named = 1;
+			context.name.start = word.start;
+			context.name.length = word.length;
+
 			word.start = NULL;
 			word.length = 0;
 			word.syntax = PARSER_SYNTAX_UNSET;
+			goto next_parse;
+		}
+		
+		if (c == '=') {
+			if (lastvalidc == ':') {
+				context.is_typed = 0;
+				context.is_valued = 1;
+				context.type.start = NULL;
+				context.type.length = 0;
+				word.start = NULL;
+				word.length = 0;
+				goto next_parse;
+			}
+			word.syntax = parser_find_match(word.start, word.length);
+			if (word.syntax == PARSER_SYNTAX_UNKNOWN && word.length > 0) {
+				printf("Unknown syntax at (line: %llu, column: %llu) [", line, i);
+				printword(stdout, word.start, word.length);
+				puts("]");
+				*out_end = &start[i];
+				return 1;
+			}
+			context.is_typed = 1;
+			context.is_valued = 1;
+			context.type.start = word.start;
+			context.type.length = word.length;
+			word.start = NULL;
+			word.length = 0;
+			goto next_parse;
+		}
+
+		if (c == ';') {
+			if (context.is_valued) {
+				context.value.start = word.start;
+				context.value.length = word.length;
+			}
+			printword(stdout, context.name.start, context.name.length);
+			printf(":");
+			printword(stdout, context.type.start, context.type.length);
+			printf("=");
+			printword(stdout, context.value.start, context.value.length);
+			puts(";");
+			context.is_done = 1;
+			word.start = NULL;
+			word.length = 0;
 			goto next_parse;
 		}
 
@@ -214,16 +292,16 @@ int parse(char * start, char ** out_end) {
 			goto next_parse;
 		}
 
+		if (iswhitespace(c)) {
+			goto next_parse;
+		}
+
 		if (word.start == NULL) {
 			word.start = &start[i];
 			word.length = 0;
 		}
+		c = start[i];
 		++word.length;
-
-		word.syntax = parser_find_match(word.start, word.length);
-		if (word.syntax >= PARSER_SYNTAX_UNKNOWN) {
-			printf("%*.s %i\n", (unsigned int) word.length, word.start, word.syntax);
-		}
 
 	next_parse:
 		++i;
